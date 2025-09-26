@@ -44,4 +44,4 @@ jobs:
         run: |
           # 语法: python <脚本名> <收件人邮箱> "<收件人姓名>" <附件路径>
           # 注意：收件人姓名用引号括起来，以防姓名中包含空格
-          python send_email.py ${{ matrix.recipient.email }} "${{ matrix.recipient.name }}" "screenshot.png"
+          python send_email.py ${{ matrix.recipient.email }} "${{ matrix.recipient.name }}" "b5a5723ca5a99989de0439dc64f6e1a303db1b83_2_1380x920.jpeg"
