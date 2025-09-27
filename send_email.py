@@ -1,104 +1,306 @@
-# 文件路径: send_email.py
-# 描述: 这是一个使用 Python 发送邮件的脚本，现已升级以支持多个附件。
+"""
+文件路径: send_email.py
+描述: 合规友好的事务邮件发送工具：支持 CSV 群发（需同意）、模板、内嵌图片、速率限制、日志、dry-run 与 EML 保存。
+"""
 
-import smtplib
 import os
 import sys
+import csv
+import re
+import time
+import smtplib
+import logging
+import mimetypes
+import argparse
+from email.utils import formataddr, make_msgid
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
 from email import encoders
 
-def attach_file(msg, attachment_path):
-    """一个辅助函数，用于将单个文件附加到邮件中"""
+
+def configure_logging(verbose):
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def load_text(path):
+    if not path:
+        return ""
     try:
-        with open(attachment_path, 'rb') as attachment:
-            filename = os.path.basename(attachment_path)
-            part = MIMEBase('application', 'octet-stream')
-            part.set_payload(attachment.read())
-            encoders.encode_base64(part)
-            
-            # 为内嵌图片添加 Content-ID (cid)
-            # 只有当文件名是 screenshot.png 时，我们才假定它是要内嵌的图片
-            if filename == "screenshot.png":
-                part.add_header('Content-ID', f'<{filename}>')
-            
-            part.add_header(
-                'Content-Disposition',
-                f'attachment; filename= {filename}',
-            )
-            msg.attach(part)
-            print(f"附件 '{filename}' 已成功附加。")
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        logging.error("读取模板失败 %s: %s", path, e)
+        sys.exit(1)
+
+
+def render_template(template_str, variables):
+    try:
+        return template_str.format(**variables)
+    except KeyError as e:
+        missing = str(e).strip("'")
+        logging.error("模板变量缺失: %s", missing)
+        sys.exit(1)
+
+
+def is_valid_email(address):
+    if not address:
+        return False
+    return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", address) is not None
+
+
+def guess_mime_type(path):
+    ctype, _ = mimetypes.guess_type(path)
+    if ctype is None:
+        return ("application", "octet-stream")
+    maintype, subtype = ctype.split("/", 1)
+    return (maintype, subtype)
+
+
+def attach_regular(msg, path):
+    try:
+        maintype, subtype = guess_mime_type(path)
+        filename = os.path.basename(path)
+        with open(path, "rb") as f:
+            if maintype == "image":
+                part = MIMEImage(f.read(), _subtype=subtype, name=filename)
+            else:
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+        msg.attach(part)
+        logging.debug("已附加附件: %s", filename)
     except FileNotFoundError:
-        print(f"警告：附件文件未找到于路径 '{attachment_path}'，已跳过。")
+        logging.warning("附件未找到，已跳过: %s", path)
     except Exception as e:
-        print(f"附加文件 '{attachment_path}' 时出错: {e}")
+        logging.error("附加附件出错 %s: %s", path, e)
 
-def send_email():
-    # --- 邮件配置 ---
-    username = os.environ.get('MAIL_USERNAME')
-    password = os.environ.get('MAIL_PASSWORD')
-    server_address = "mail12.serv00.com"
-    server_port = 587
-    from_name = "FBI"
-    from_addr = username
-    subject = "【多附件更新】来自 FBI"
 
-    # --- 从命令行参数获取信息 ---
-    if len(sys.argv) < 3:
-        print("错误：需要提供收件人邮箱和姓名作为参数。")
-        sys.exit(1)
-
-    to_addr = sys.argv[1]
-    to_name = sys.argv[2]
-    
-    # 第四个参数现在是逗号分隔的附件列表字符串
-    attachment_paths_str = sys.argv[3] if len(sys.argv) > 3 else ""
-
-    # --- 构造邮件正文 (HTML) ---
-    html_body = f"""
-    <h3>紧急调查通知</h3>
-    <hr>
-    <p>你好, <strong>{to_name}</strong> 先生,</p>
-    <p>我们注意到一些需要您配合调查的情况。您可能涉嫌违反了佛罗里达州的相关法律。</p>
-    <p><strong>具体事项如下:</strong></p>
-    <ul>
-      <li>涉嫌浏览并传播限制内容。</li>
-      <li>需要您前来警局进行情况说明。</li>
-    </ul>
-    <p>相关证据材料（内嵌图片和附件）如下：</p>
-    <p><img src="cid:screenshot.png" alt="证据截图" style="width: 400px; height: auto;"></p>
-    <p>更多详情请<a href="https://www.fbi.gov">点击此处访问官网</a>。</p>
-    <p>请尽快与我们联系。</p>
-    <p><em>此致,</em><br><em>FBI</em></p>
-    """
-
-    # --- 创建邮件对象 ---
-    msg = MIMEMultipart()
-    msg['From'] = f"{from_name} <{from_addr}>"
-    msg['To'] = to_addr
-    msg['Subject'] = subject
-    msg.attach(MIMEText(html_body, 'html'))
-
-    # --- 附加所有文件 ---
-    if attachment_paths_str:
-        # 按逗号分割字符串，得到一个附件路径列表
-        attachment_list = [path.strip() for path in attachment_paths_str.split(',')]
-        for path in attachment_list:
-            if path: # 确保路径不为空
-                attach_file(msg, path)
-
-    # --- 发送邮件 ---
+def attach_inline(msg, path):
+    cid = None
     try:
-        server = smtplib.SMTP(server_address, server_port)
-        server.starttls()
-        server.login(username, password)
-        server.send_message(msg)
-        server.quit()
-        print(f"邮件已成功发送至 {to_addr}")
+        maintype, subtype = guess_mime_type(path)
+        filename = os.path.basename(path)
+        with open(path, "rb") as f:
+            if maintype == "image":
+                part = MIMEImage(f.read(), _subtype=subtype, name=filename)
+            else:
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+        cid = filename  # 使用文件名作为 cid
+        part.add_header("Content-ID", f"<{cid}>")
+        part.add_header("Content-Disposition", f'inline; filename="{filename}"')
+        msg.attach(part)
+        logging.debug("已内嵌资源: %s (cid=%s)", filename, cid)
+        return cid
+    except FileNotFoundError:
+        logging.warning("内嵌资源未找到，已跳过: %s", path)
+        return ""
     except Exception as e:
-        print(f"邮件发送失败: {e}")
-        sys.exit(1)
+        logging.error("内嵌资源附加出错 %s: %s", path, e)
+        return ""
 
-if __name__ == '__main__':
-    send_email()
+
+def build_message(from_name, from_addr, to_addr, subject, text_body, html_body,
+                  inline_paths, attach_paths, reply_to, unsubscribe, save_eml_dir):
+    msg = MIMEMultipart("mixed")
+    msg["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg["Message-ID"] = make_msgid()
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    if unsubscribe:
+        msg["List-Unsubscribe"] = unsubscribe
+
+    alt = MIMEMultipart("alternative")
+    if text_body:
+        alt.attach(MIMEText(text_body, "plain", "utf-8"))
+    if html_body:
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(alt)
+
+    cid_map = {}
+    for p in inline_paths or []:
+        cid = attach_inline(msg, p)
+        if cid:
+            cid_map[os.path.basename(p)] = cid
+
+    for p in attach_paths or []:
+        attach_regular(msg, p)
+
+    if save_eml_dir:
+        try:
+            os.makedirs(save_eml_dir, exist_ok=True)
+            filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", f"{to_addr}_{int(time.time())}.eml")
+            dest = os.path.join(save_eml_dir, filename)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(msg.as_string())
+            logging.debug("已保存 EML: %s", dest)
+        except Exception as e:
+            logging.error("保存 EML 失败: %s", e)
+
+    return msg, cid_map
+
+
+def send_messages(args):
+    username = args.username or os.environ.get("MAIL_USERNAME")
+    password = args.password or os.environ.get("MAIL_PASSWORD")
+    server_address = args.server or os.environ.get("MAIL_SERVER") or "smtp.example.com"
+    server_port = int(args.port or os.environ.get("MAIL_PORT") or 587)
+
+    if args.dry_run:
+        logging.info("Dry-run 模式：不会实际发送邮件。")
+
+    smtp = None
+    if not args.dry_run:
+        if not username or not password:
+            logging.error("缺少 SMTP 凭据。请设置 --username/--password 或环境变量。")
+            sys.exit(1)
+        try:
+            smtp = smtplib.SMTP(server_address, server_port, timeout=30)
+            smtp.starttls()
+            smtp.login(username, password)
+        except Exception as e:
+            logging.error("连接/登录 SMTP 失败: %s", e)
+            sys.exit(1)
+
+    default_text = "Hi {name},\n\nThis is a friendly message.\n"
+    default_html = "<p>Hi <strong>{name}</strong>,</p><p>This is a friendly message.</p>"
+
+    template_text = load_text(args.template_text) if args.template_text else default_text
+    template_html = load_text(args.template_html) if args.template_html else default_html
+
+    rate_delay = 0.0
+    if args.rate_per_minute and args.rate_per_minute > 0:
+        rate_delay = 60.0 / float(args.rate_per_minute)
+
+    total = 0
+    sent = 0
+    skipped = 0
+    seen = set()
+
+    def iter_recipients():
+        if args.csv:
+            with open(args.csv, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    yield row.get(args.email_field or "email", "").strip(), row.get(args.name_field or "name", "").strip(), row
+        else:
+            yield args.to, args.name or "", {}
+
+    for email_addr, name, row in iter_recipients():
+        total += 1
+        if not is_valid_email(email_addr):
+            logging.warning("邮箱无效，跳过: %s", email_addr)
+            skipped += 1
+            continue
+        if email_addr in seen:
+            logging.info("检测到重复邮箱，跳过: %s", email_addr)
+            skipped += 1
+            continue
+        seen.add(email_addr)
+        if args.require_consent:
+            consent_value = (row.get(args.consent_field, "") if row else "").strip().lower()
+            if args.csv and consent_value not in ("1", "true", "yes", "y"):
+                logging.info("无明确同意(consent)，跳过: %s", email_addr)
+                skipped += 1
+                continue
+
+        # 变量包含基础字段与 CSV 行的所有列，便于模板中直接使用 {列名}
+        variables = {"name": name or email_addr, "email": email_addr}
+        if row:
+            for k, v in row.items():
+                if k not in variables:
+                    variables[k] = v
+        text_body = render_template(template_text, variables) if template_text else ""
+        html_body = render_template(template_html, variables) if template_html else ""
+
+        msg, _ = build_message(
+            from_name=args.from_name,
+            from_addr=args.from_addr or username or "",
+            to_addr=email_addr,
+            subject=args.subject,
+            text_body=text_body,
+            html_body=html_body,
+            inline_paths=args.inline or [],
+            attach_paths=args.attach or [],
+            reply_to=args.reply_to,
+            unsubscribe=args.unsubscribe,
+            save_eml_dir=args.save_eml_dir
+        )
+
+        if args.dry_run:
+            logging.info("Dry-run: 构建完成 -> %s, 主题: %s", email_addr, args.subject)
+            sent += 1
+        else:
+            try:
+                smtp.send_message(msg)
+                logging.info("已发送 -> %s", email_addr)
+                sent += 1
+                if rate_delay > 0:
+                    time.sleep(rate_delay)
+            except Exception as e:
+                logging.error("发送失败 %s: %s", email_addr, e)
+                skipped += 1
+
+    if smtp:
+        try:
+            smtp.quit()
+        except Exception:
+            pass
+
+    logging.info("完成：总计=%d 成功=%d 跳过=%d", total, sent, skipped)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="合规友好的事务邮件发送工具")
+    recipients = parser.add_mutually_exclusive_group(required=True)
+    recipients.add_argument("--to", help="单个收件人邮箱")
+    recipients.add_argument("--csv", help="CSV 文件路径，需包含 email,name,consent 等列")
+
+    parser.add_argument("--name", help="单个收件人姓名")
+    parser.add_argument("--email-field", default="email", help="CSV 邮箱列名，默认 email")
+    parser.add_argument("--name-field", default="name", help="CSV 姓名列名，默认 name")
+    parser.add_argument("--consent-field", default="consent", help="CSV 同意列名，默认 consent")
+    parser.add_argument("--require-consent", action="store_true", default=True, help="仅向已同意的收件人发送")
+    parser.add_argument("--no-require-consent", dest="require_consent", action="store_false", help="允许忽略 consent")
+
+    parser.add_argument("--subject", default="Hello from Example", help="邮件主题")
+    parser.add_argument("--from-addr", help="发件邮箱，不填则使用 MAIL_USERNAME")
+    parser.add_argument("--from-name", default="Example Team", help="发件人名称")
+    parser.add_argument("--reply-to", help="Reply-To 邮箱")
+    parser.add_argument("--unsubscribe", help='List-Unsubscribe 头，如 "<mailto:unsubscribe@example.com>, <https://example.com/unsub?id=123>"')
+
+    parser.add_argument("--template-text", help="纯文本模板文件路径，支持 {name} 等变量")
+    parser.add_argument("--template-html", help="HTML 模板文件路径，支持 {name} 等变量")
+
+    parser.add_argument("--attach", action="append", help="添加附件，可重复传入")
+    parser.add_argument("--inline", action="append", help="添加内嵌资源(图片等)，HTML 使用 cid:文件名 引用")
+
+    parser.add_argument("--save-eml-dir", help="保存生成的 .eml 文件目录")
+
+    parser.add_argument("--server", help="SMTP 服务器地址，默认取 MAIL_SERVER")
+    parser.add_argument("--port", type=int, help="SMTP 端口，默认取 MAIL_PORT 或 587")
+    parser.add_argument("--username", help="SMTP 用户名，默认取 MAIL_USERNAME")
+    parser.add_argument("--password", help="SMTP 密码，默认取 MAIL_PASSWORD")
+
+    parser.add_argument("--rate-per-minute", type=float, help="每分钟发送上限，用于限速")
+    parser.add_argument("--dry-run", action="store_true", help="仅构建，不发送")
+    parser.add_argument("--verbose", action="store_true", help="显示调试日志")
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    configure_logging(args.verbose)
+    send_messages(args)
+
+
+if __name__ == "__main__":
+    main()
